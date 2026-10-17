@@ -1,12 +1,12 @@
 // chess-game.js
-// VERSION: 2.7.0 - Working clock (Fischer increment), AI time budget tied to clock
+// VERSION: 2.7.8 - Opening development penalty (curbs flank-pawn madness)
 // COMPATIBLE WITH: chess-ai-database.js (v2.0), index.html, chess-game-database.js (v1.1)
 
-const GAME_VERSION = "2.7.0";
+const GAME_VERSION = "2.7.8";
 
-// ============================================================
-// PIECE CODES
-// ============================================================
+const USE_TT = true;
+const TT_BITS = 18;
+
 const EMPTY = 0;
 const WP = 1, WN = 2, WB = 3, WR = 4, WQ = 5, WK = 6;
 const BP = 7, BN = 8, BB = 9, BR = 10, BQ = 11, BK = 12;
@@ -23,9 +23,6 @@ function isPlayerPieceCode(p, player) {
 }
 function enemyColor(c) { return c === 'white' ? 'black' : 'white'; }
 
-// ============================================================
-// SQUARE HELPERS
-// ============================================================
 const SQ_FILES = ['a','b','c','d','e','f','g','h'];
 function sqName(sq) { return SQ_FILES[sq & 7] + (8 - (sq >> 3)); }
 function sqFromRC(row, col) { return row * 8 + col; }
@@ -34,8 +31,12 @@ function sqCol(sq) { return sq & 7; }
 function isInBounds(row, col) { return row >= 0 && row < 8 && col >= 0 && col < 8; }
 
 // ============================================================
-// PRECOMPUTED ATTACK TABLES
+// v2.7.7: Precomputed flat direction tables (dr,dc pairs).
 // ============================================================
+const ROOK_DIRS_FLAT   = [-1,0, 1,0, 0,-1, 0,1];
+const BISHOP_DIRS_FLAT = [-1,-1, -1,1, 1,-1, 1,1];
+const QUEEN_DIRS_FLAT  = [-1,0, 1,0, 0,-1, 0,1, -1,-1, -1,1, 1,-1, 1,1];
+
 const KNIGHT_ATTACKS = new Int8Array(64 * 8);
 const KING_ATTACKS = new Int8Array(64 * 8);
 const KNIGHT_DEGREE = new Int8Array(64);
@@ -70,9 +71,143 @@ const KING_DEGREE = new Int8Array(64);
     }
 })();
 
-// ============================================================
-// GLOBAL STATE
-// ============================================================
+const ZOBRIST_PIECE_LO = [];
+const ZOBRIST_PIECE_HI = [];
+const ZOBRIST_SIDE_LO = (Math.random() * 0x100000000) | 0;
+const ZOBRIST_SIDE_HI = (Math.random() * 0x100000000) | 0;
+const ZOBRIST_CASTLE_LO = [];
+const ZOBRIST_CASTLE_HI = [];
+const ZOBRIST_EP_LO = [];
+const ZOBRIST_EP_HI = [];
+
+(function initZobrist() {
+    for (let p = 0; p <= 12; p++) {
+        const lo = new Int32Array(64);
+        const hi = new Int32Array(64);
+        for (let s = 0; s < 64; s++) {
+            lo[s] = (Math.random() * 0x100000000) | 0;
+            hi[s] = (Math.random() * 0x100000000) | 0;
+        }
+        ZOBRIST_PIECE_LO[p] = lo;
+        ZOBRIST_PIECE_HI[p] = hi;
+    }
+    for (let i = 0; i < 4; i++) {
+        ZOBRIST_CASTLE_LO[i] = (Math.random() * 0x100000000) | 0;
+        ZOBRIST_CASTLE_HI[i] = (Math.random() * 0x100000000) | 0;
+    }
+    for (let i = 0; i < 8; i++) {
+        ZOBRIST_EP_LO[i] = (Math.random() * 0x100000000) | 0;
+        ZOBRIST_EP_HI[i] = (Math.random() * 0x100000000) | 0;
+    }
+})();
+
+function computeHash(b, player) {
+    let lo = 0, hi = 0;
+    for (let sq = 0; sq < 64; sq++) {
+        const p = b[sq];
+        if (p !== 0) {
+            lo ^= ZOBRIST_PIECE_LO[p][sq];
+            hi ^= ZOBRIST_PIECE_HI[p][sq];
+        }
+    }
+    if (player === 'black') {
+        lo ^= ZOBRIST_SIDE_LO;
+        hi ^= ZOBRIST_SIDE_HI;
+    }
+    if (castlingRights.whiteKingside)  { lo ^= ZOBRIST_CASTLE_LO[0]; hi ^= ZOBRIST_CASTLE_HI[0]; }
+    if (castlingRights.whiteQueenside) { lo ^= ZOBRIST_CASTLE_LO[1]; hi ^= ZOBRIST_CASTLE_HI[1]; }
+    if (castlingRights.blackKingside)  { lo ^= ZOBRIST_CASTLE_LO[2]; hi ^= ZOBRIST_CASTLE_HI[2]; }
+    if (castlingRights.blackQueenside) { lo ^= ZOBRIST_CASTLE_LO[3]; hi ^= ZOBRIST_CASTLE_HI[3]; }
+    if (enPassantTarget) {
+        const f = enPassantTarget.sq & 7;
+        lo ^= ZOBRIST_EP_LO[f];
+        hi ^= ZOBRIST_EP_HI[f];
+    }
+    return { lo: lo | 0, hi: hi | 0 };
+}
+
+const TT_SIZE = 1 << TT_BITS;
+const TT_MASK = TT_SIZE - 1;
+const ttKeys   = new Int32Array(TT_SIZE);
+const ttVerify = new Int32Array(TT_SIZE);
+const ttScore  = new Int32Array(TT_SIZE);
+const ttDepth  = new Int8Array(TT_SIZE);
+const ttFlag   = new Int8Array(TT_SIZE);
+const ttFrom   = new Int8Array(TT_SIZE);
+const ttTo     = new Int8Array(TT_SIZE);
+
+const TT_EXACT = 1, TT_LOWER = 2, TT_UPPER = 3;
+const MATE_THRESHOLD = 18000;
+
+let ttHits = 0;
+let ttProbes = 0;
+let ttStores = 0;
+let ttCutoffs = 0;
+
+function ttClear() {
+    ttFlag.fill(0);
+    ttHits = 0;
+    ttProbes = 0;
+    ttStores = 0;
+    ttCutoffs = 0;
+}
+
+function adjustStoreScore(score, ply) {
+    if (score > MATE_THRESHOLD) return score + ply;
+    if (score < -MATE_THRESHOLD) return score - ply;
+    return score;
+}
+function adjustProbeScore(score, ply) {
+    if (score > MATE_THRESHOLD) return score - ply;
+    if (score < -MATE_THRESHOLD) return score + ply;
+    return score;
+}
+
+function ttProbe(lo, hi, depth, alpha, beta, ply) {
+    const idx = hi & TT_MASK;
+    if (ttFlag[idx] === 0) return null;
+    if (ttKeys[idx] !== hi || ttVerify[idx] !== lo) return null;
+
+    const entryDepth = ttDepth[idx];
+    const entryScore = adjustProbeScore(ttScore[idx], ply);
+    const entryFlag = ttFlag[idx];
+    const entryMove = (ttFrom[idx] >= 0) ? { from: ttFrom[idx], to: ttTo[idx] } : null;
+
+    if (entryDepth >= depth) {
+        if (entryFlag === TT_EXACT) return { score: entryScore, move: entryMove };
+        if (entryFlag === TT_LOWER && entryScore >= beta) return { score: entryScore, move: entryMove };
+        if (entryFlag === TT_UPPER && entryScore <= alpha) return { score: entryScore, move: entryMove };
+    }
+    if (entryMove) return { score: null, move: entryMove };
+    return null;
+}
+
+function ttStore(lo, hi, depth, score, flag, move) {
+    const idx = hi & TT_MASK;
+    const existingFlag = ttFlag[idx];
+    const existingDepth = ttDepth[idx];
+    if (existingFlag !== 0 && existingDepth > depth) {
+        if (ttKeys[idx] === hi && ttVerify[idx] === lo) {
+            if (existingDepth > depth) return;
+        } else {
+            return;
+        }
+    }
+    ttKeys[idx] = hi;
+    ttVerify[idx] = lo;
+    ttDepth[idx] = depth;
+    ttFlag[idx] = flag;
+    ttScore[idx] = score;
+    if (move) {
+        ttFrom[idx] = move.from;
+        ttTo[idx] = move.to;
+    } else {
+        ttFrom[idx] = -1;
+        ttTo[idx] = -1;
+    }
+    ttStores++;
+}
+
 let board = new Int8Array(64);
 let kingSq = { white: 60, black: 4 };
 let currentPlayer = 'white';
@@ -101,9 +236,6 @@ let moveTree = null;
 
 let gamePositionCounts = new Map();
 
-// ============================================================
-// CLOCK
-// ============================================================
 const clockState = {
     enabled: false,
     whiteMs: 0,
@@ -232,9 +364,6 @@ function startClockTicker() {
     }, 100);
 }
 
-// ============================================================
-// BOARD INIT
-// ============================================================
 function resetBoardToStart() {
     board.fill(0);
     const back = [WR, WN, WB, WQ, WK, WB, WN, WR];
@@ -276,9 +405,6 @@ function displayArrayToBoard(display) {
 
 resetBoardToStart();
 
-// ============================================================
-// ATTACK DETECTION
-// ============================================================
 function isSquareAttackedBy(b, sq, byColor) {
     const r = sq >> 3, c = sq & 7;
 
@@ -312,7 +438,8 @@ function isSquareAttackedBy(b, sq, byColor) {
     const enemyB = byColor === 'white' ? WB : BB;
     const enemyQ = byColor === 'white' ? WQ : BQ;
 
-    for (const [dr, dc] of [[-1,0],[1,0],[0,-1],[0,1]]) {
+    for (let i = 0; i < ROOK_DIRS_FLAT.length; i += 2) {
+        const dr = ROOK_DIRS_FLAT[i], dc = ROOK_DIRS_FLAT[i+1];
         let nr = r + dr, nc = c + dc;
         while (nr >= 0 && nr < 8 && nc >= 0 && nc < 8) {
             const p = b[sqFromRC(nr, nc)];
@@ -323,7 +450,8 @@ function isSquareAttackedBy(b, sq, byColor) {
             nr += dr; nc += dc;
         }
     }
-    for (const [dr, dc] of [[-1,-1],[-1,1],[1,-1],[1,1]]) {
+    for (let i = 0; i < BISHOP_DIRS_FLAT.length; i += 2) {
+        const dr = BISHOP_DIRS_FLAT[i], dc = BISHOP_DIRS_FLAT[i+1];
         let nr = r + dr, nc = c + dc;
         while (nr >= 0 && nr < 8 && nc >= 0 && nc < 8) {
             const p = b[sqFromRC(nr, nc)];
@@ -350,9 +478,6 @@ function isKingInCheckForPosition(b, player) {
     return isSquareAttackedBy(b, k, enemyColor(player));
 }
 
-// ============================================================
-// MAKE / UNMAKE
-// ============================================================
 function makeMoveOnBoard(b, move) {
     const from = move.from, to = move.to;
     const piece = b[from];
@@ -457,9 +582,6 @@ function unmakeMoveOnBoard(b, move) {
     halfMoveCount = undo.halfMoveCount;
 }
 
-// ============================================================
-// MOVE GENERATION
-// ============================================================
 function generatePseudoMoves(b, player) {
     const moves = [];
     const isWhite = player === 'white';
@@ -558,12 +680,11 @@ function generatePseudoMoves(b, player) {
                 }
             }
         } else {
-            let dirs;
-            if (type === 4) dirs = [[-1,0],[1,0],[0,-1],[0,1]];
-            else if (type === 3) dirs = [[-1,-1],[-1,1],[1,-1],[1,1]];
-            else dirs = [[-1,0],[1,0],[0,-1],[0,1],[-1,-1],[-1,1],[1,-1],[1,1]];
-
-            for (const [dr, dc] of dirs) {
+            const dirs = type === 4 ? ROOK_DIRS_FLAT
+                       : type === 3 ? BISHOP_DIRS_FLAT
+                       : QUEEN_DIRS_FLAT;
+            for (let i = 0; i < dirs.length; i += 2) {
+                const dr = dirs[i], dc = dirs[i+1];
                 let nr = r + dr, nc = c + dc;
                 while (nr >= 0 && nr < 8 && nc >= 0 && nc < 8) {
                     const to = sqFromRC(nr, nc);
@@ -599,9 +720,6 @@ function getAllPossibleMovesForPosition(b, player) {
     return legal;
 }
 
-// ============================================================
-// UI HELPERS
-// ============================================================
 function isValidMove(fromRow, fromCol, toRow, toCol) {
     if (toRow < 0 || toRow > 7 || toCol < 0 || toCol > 7) return false;
     const from = sqFromRC(fromRow, fromCol);
@@ -627,9 +745,6 @@ function isPlayerPiece(piece, player) {
     return false;
 }
 
-// ============================================================
-// SAN NOTATION
-// ============================================================
 const SAN_LETTER = ['', '', 'N', 'B', 'R', 'Q', 'K', '', 'N', 'B', 'R', 'Q', 'K'];
 
 function toSAN(b, move, player) {
@@ -689,16 +804,15 @@ function checkSuffix(b, move, player) {
     return suffix;
 }
 
-// ============================================================
-// EVAL
-// ============================================================
 const evalCache = new Map();
 const CACHE_LIMIT = 500000;
 
+const HASH_CHARS = new Array(13);
+for (let i = 0; i < 13; i++) HASH_CHARS[i] = String.fromCharCode(48 + i);
+const HASH_BUF = new Array(64);
 function boardToHash(b) {
-    let s = '';
-    for (let i = 0; i < 64; i++) s += String.fromCharCode(48 + b[i]);
-    return s;
+    for (let i = 0; i < 64; i++) HASH_BUF[i] = HASH_CHARS[b[i]];
+    return HASH_BUF.join('');
 }
 
 function cacheGet(cache, key) {
@@ -710,7 +824,7 @@ function cacheSet(cache, key, value) {
     cache.set(key, { value });
 }
 
-function pieceMobility(b, sq, player) {
+function pieceMobility(b, sq) {
     const piece = b[sq];
     if (piece === 0) return 0;
     const type = pieceType(piece);
@@ -728,16 +842,17 @@ function pieceMobility(b, sq, player) {
         }
     } else if (type === 2) {
         const base = sq * 8;
-        for (let i = 0; i < KNIGHT_DEGREE[sq]; i++) {
+        const deg = KNIGHT_DEGREE[sq];
+        for (let i = 0; i < deg; i++) {
             const t = b[KNIGHT_ATTACKS[base + i]];
             if (t === 0 || isWhitePiece(t) !== isWhite) count++;
         }
     } else if (type === 3 || type === 4 || type === 5) {
-        let dirs;
-        if (type === 4) dirs = [[-1,0],[1,0],[0,-1],[0,1]];
-        else if (type === 3) dirs = [[-1,-1],[-1,1],[1,-1],[1,1]];
-        else dirs = [[-1,0],[1,0],[0,-1],[0,1],[-1,-1],[-1,1],[1,-1],[1,1]];
-        for (const [dr, dc] of dirs) {
+        const dirs = type === 4 ? ROOK_DIRS_FLAT
+                   : type === 3 ? BISHOP_DIRS_FLAT
+                   : QUEEN_DIRS_FLAT;
+        for (let i = 0; i < dirs.length; i += 2) {
+            const dr = dirs[i], dc = dirs[i+1];
             let nr = r + dr, nc = c + dc;
             while (nr >= 0 && nr < 8 && nc >= 0 && nc < 8) {
                 const t = b[sqFromRC(nr, nc)];
@@ -748,7 +863,8 @@ function pieceMobility(b, sq, player) {
         }
     } else if (type === 6) {
         const base = sq * 8;
-        for (let i = 0; i < KING_DEGREE[sq]; i++) {
+        const deg = KING_DEGREE[sq];
+        for (let i = 0; i < deg; i++) {
             const t = b[KING_ATTACKS[base + i]];
             if (t === 0 || isWhitePiece(t) !== isWhite) count++;
         }
@@ -772,6 +888,71 @@ function countShieldPawns(b, kSq, isWhite) {
     return count;
 }
 
+function isKnightOutpost(b, sq, isWhite) {
+    const r = sq >> 3, c = sq & 7;
+    if (r < 2 || r > 5) return false;
+    let defended = false;
+    if (isWhite) {
+        if (c > 0 && r < 7 && b[sqFromRC(r+1, c-1)] === WP) defended = true;
+        if (c < 7 && r < 7 && b[sqFromRC(r+1, c+1)] === WP) defended = true;
+    } else {
+        if (c > 0 && r > 0 && b[sqFromRC(r-1, c-1)] === BP) defended = true;
+        if (c < 7 && r > 0 && b[sqFromRC(r-1, c+1)] === BP) defended = true;
+    }
+    if (!defended) return false;
+    const enemyPawn = isWhite ? BP : WP;
+    for (const df of [-1, 1]) {
+        const f = c + df;
+        if (f < 0 || f > 7) continue;
+        if (isWhite) {
+            for (let pr = 0; pr < r; pr++) {
+                if (b[sqFromRC(pr, f)] === enemyPawn) return false;
+            }
+        } else {
+            for (let pr = r + 1; pr < 8; pr++) {
+                if (b[sqFromRC(pr, f)] === enemyPawn) return false;
+            }
+        }
+    }
+    return true;
+}
+
+function pawnStormDanger(b, kSq, attackerIsWhite) {
+    const kFile = kSq & 7;
+    const attackerPawn = attackerIsWhite ? WP : BP;
+    let danger = 0;
+    for (let sq = 0; sq < 64; sq++) {
+        if (b[sq] !== attackerPawn) continue;
+        const r = sq >> 3, c = sq & 7;
+        const fileDist = Math.abs(c - kFile);
+        if (fileDist > 3) continue;
+        const advance = attackerIsWhite ? (6 - r) : (r - 1);
+        if (advance <= 0) continue;
+        const fileWeight = Math.max(1, 4 - fileDist);
+        danger += advance * fileWeight * 15;
+    }
+    return danger;
+}
+
+function isPassedPawn(b, sq, isWhite) {
+    const r = sq >> 3, c = sq & 7;
+    const enemyPawn = isWhite ? BP : WP;
+    for (let df = -1; df <= 1; df++) {
+        const f = c + df;
+        if (f < 0 || f > 7) continue;
+        if (isWhite) {
+            for (let rr = 0; rr < r; rr++) {
+                if (b[sqFromRC(rr, f)] === enemyPawn) return false;
+            }
+        } else {
+            for (let rr = r + 1; rr < 8; rr++) {
+                if (b[sqFromRC(rr, f)] === enemyPawn) return false;
+            }
+        }
+    }
+    return true;
+}
+
 function evaluatePositionForSearch(b, player, moveNumber) {
     if (!b) return 0;
     const key = boardToHash(b) + "|" + moveNumber;
@@ -779,6 +960,7 @@ function evaluatePositionForSearch(b, player, moveNumber) {
     if (cached !== undefined) return cached;
 
     let score = 0;
+    let materialDiff = 0;
     let pieceCount = 0;
     let wNonPawnMaterial = 0;
     let bNonPawnMaterial = 0;
@@ -803,8 +985,8 @@ function evaluatePositionForSearch(b, player, moveNumber) {
         const p = b[sq];
         if (p === 0) continue;
         const v = PIECE_VALUE_ARR[p];
-        if (isWhitePiece(p)) score += v;
-        else score -= v;
+        if (isWhitePiece(p)) { score += v; materialDiff += v; }
+        else { score -= v; materialDiff -= v; }
         if (pieceType(p) !== 6) pieceCount++;
 
         const pt = pieceType(p);
@@ -817,7 +999,7 @@ function evaluatePositionForSearch(b, player, moveNumber) {
             else bNonPawnMaterial += v;
         }
 
-        const mob = pieceMobility(b, sq, isWhitePiece(p) ? 'white' : 'black');
+        const mob = pieceMobility(b, sq);
         const weight = pt === 2 ? 8 : pt === 3 ? 6 : pt === 4 ? 4 : pt === 5 ? 1 : 1;
         score += (isWhitePiece(p) ? 1 : -1) * mob * weight * 0.5;
 
@@ -828,11 +1010,47 @@ function evaluatePositionForSearch(b, player, moveNumber) {
 
         const isWhite = isWhitePiece(p);
 
+        if (pt === 1) {
+            const pawn = p;
+            let doubled = false;
+            for (let rr = 0; rr < 8; rr++) {
+                if (rr !== r && b[sqFromRC(rr, c)] === pawn) { doubled = true; break; }
+            }
+            if (doubled) score += isWhite ? -12 : 12;
+            let isolated = true;
+            for (const df of [-1, 1]) {
+                const f = c + df;
+                if (f < 0 || f > 7) continue;
+                for (let rr = 0; rr < 8; rr++) {
+                    if (b[sqFromRC(rr, f)] === pawn) { isolated = false; break; }
+                }
+                if (!isolated) break;
+            }
+            if (isolated) score += isWhite ? -15 : 15;
+        }
+
         if (pt === 2 || pt === 3) {
             const backRank = isWhite ? 7 : 0;
             if ((sq >> 3) === backRank) {
                 score += isWhite ? (pt === 2 ? -25 : -15) : (pt === 2 ? 25 : 15);
             }
+        }
+
+        if (pt === 2) {
+            if (isKnightOutpost(b, sq, isWhite)) score += isWhite ? 30 : -30;
+        }
+
+        if (pt === 4) {
+            const ownPawn = isWhite ? WP : BP;
+            const enemyPawn = isWhite ? BP : WP;
+            let hasOwn = false, hasEnemy = false;
+            for (let rr = 0; rr < 8; rr++) {
+                const pp = b[sqFromRC(rr, c)];
+                if (pp === ownPawn) hasOwn = true;
+                else if (pp === enemyPawn) hasEnemy = true;
+            }
+            if (!hasOwn && !hasEnemy) score += isWhite ? 25 : -25;
+            else if (!hasOwn) score += isWhite ? 12 : -12;
         }
 
         if (pt === 5) {
@@ -845,7 +1063,6 @@ function evaluatePositionForSearch(b, player, moveNumber) {
         }
     }
 
-    // Bishop pair bonus
     if (wBishopCount >= 2) score += 25;
     if (bBishopCount >= 2) score -= 25;
 
@@ -856,9 +1073,9 @@ function evaluatePositionForSearch(b, player, moveNumber) {
         let count = 0;
         for (let i = 0; i < rooks.length; i++) {
             for (let j = i + 1; j < rooks.length; j++) {
-                const a = rooks[i], c = rooks[j];
+                const a = rooks[i], c2 = rooks[j];
                 const ar = a >> 3, ac = a & 7;
-                const cr = c >> 3, cc = c & 7;
+                const cr = c2 >> 3, cc = c2 & 7;
                 if (ar === cr) {
                     const lo = Math.min(ac, cc), hi = Math.max(ac, cc);
                     let clear = true;
@@ -914,6 +1131,9 @@ function evaluatePositionForSearch(b, player, moveNumber) {
         }
     }
 
+    wKingDanger += pawnStormDanger(b, wKing, false);
+    bKingDanger += pawnStormDanger(b, bKing, true);
+
     if (isSquareAttackedBy(b, wKing, 'black')) wKingDanger += 200;
     if (isSquareAttackedBy(b, bKing, 'white')) bKingDanger += 200;
 
@@ -931,24 +1151,120 @@ function evaluatePositionForSearch(b, player, moveNumber) {
     score -= wKingDanger * 0.5;
     score += bKingDanger * 0.5;
 
+    // ============================================================
+    // OPENING DEVELOPMENT (v2.7.8)
+    // Fades from full strength at move 1 to zero at move 16.
+    // Fixes: AI plays flank pawn pushes instead of developing.
+    // ============================================================
+    if (moveNumber <= 16) {
+        const fade = Math.max(0, (16 - moveNumber) / 15);
+
+        // (a) Reward developed minors (pieces off their home rank)
+        let wDev = 0, bDev = 0;
+        for (let sq = 0; sq < 64; sq++) {
+            const p = b[sq];
+            if (p === 0) continue;
+            const pt = pieceType(p);
+            if (pt !== 2 && pt !== 3) continue;
+            const backRank = isWhitePiece(p) ? 7 : 0;
+            if ((sq >> 3) !== backRank) {
+                if (isWhitePiece(p)) wDev++;
+                else bDev++;
+            }
+        }
+        score += (wDev - bDev) * 40 * fade;
+
+        // (b) Extra penalty for undeveloped minors
+        //     (stacks on the existing -25/-15 back-rank term)
+        score -= wUndevelopedMinors * 30 * fade;
+        score += bUndevelopedMinors * 30 * fade;
+
+        // (c) Penalize own flank pawn advances past the 4th rank before
+        //     development is complete — weakens king, wastes tempos.
+        for (let sq = 0; sq < 64; sq++) {
+            const p = b[sq];
+            if (p === 0) continue;
+            const r = sq >> 3, c = sq & 7;
+            const isFlank = (c <= 1 || c >= 6);   // a, b, g, h files
+            if (!isFlank) continue;
+            if (p === WP && r <= 4) score -= 18 * fade;
+            else if (p === BP && r >= 3) score += 18 * fade;
+        }
+
+        // (d) Castling / uncastled-king penalty
+        if (wKing === 62 || wKing === 58) score += 50 * fade;   // castled
+        else if (wKingRow === 7)          score -= 20 * fade;   // still home
+        if (bKing === 6  || bKing === 2 ) score -= 50 * fade;
+        else if (bKingRow === 0)          score += 20 * fade;
+    }
+
+    // ============================================================
+    // PAWN ADVANCEMENT (v2.7.5)
+    // ============================================================
     for (let sq = 0; sq < 64; sq++) {
         const p = b[sq];
         if (p === WP) {
             const r = sq >> 3;
-            if (r === 1) score += 400;
-            else if (r === 2) score += 200;
-            else if (r === 3) score += 80;
+            const passed = isPassedPawn(b, sq, true);
+            if (r === 1) {
+                score += 400;
+                if (passed) score += 150;
+            } else if (r === 2) {
+                score += 150;
+                if (passed) score += 50;
+            } else if (r === 3) {
+                score += 50;
+            }
         } else if (p === BP) {
             const r = sq >> 3;
-            if (r === 6) score -= 400;
-            else if (r === 5) score -= 200;
-            else if (r === 4) score -= 80;
+            const passed = isPassedPawn(b, sq, false);
+            if (r === 6) {
+                score -= 400;
+                if (passed) score -= 150;
+            } else if (r === 5) {
+                score -= 150;
+                if (passed) score -= 50;
+            } else if (r === 4) {
+                score -= 50;
+            }
+        }
+    }
+
+    if (pieceCount <= 3) {
+        for (let sq = 0; sq < 64; sq++) {
+            const p = b[sq];
+            if (p !== WP && p !== BP) continue;
+            const pr = sq >> 3, pc = sq & 7;
+
+            if (p === WP) {
+                if (wKingRow < pr && Math.abs(wKingCol - pc) <= 1) score += 120;
+                if (wKingRow === 0 && wKingCol === pc && (pc === 0 || pc === 7)) score -= 250;
+                if (pr === 1 && wKingRow === 0 && Math.abs(wKingCol - pc) <= 1) score -= 80;
+            } else {
+                if (bKingRow > pr && Math.abs(bKingCol - pc) <= 1) score -= 120;
+                if (bKingRow === 7 && bKingCol === pc && (pc === 0 || pc === 7)) score += 250;
+                if (pr === 6 && bKingRow === 7 && Math.abs(bKingCol - pc) <= 1) score += 80;
+            }
         }
     }
 
     if (pieceCount <= 10) {
         score += ((7 - (wKing >> 3)) + (wKing & 7)) * 3;
         score -= ((bKing >> 3) + (7 - (bKing & 7))) * 3;
+
+        const wEdgeDist = Math.min(wKingRow, 7 - wKingRow, wKingCol, 7 - wKingCol);
+        const bEdgeDist = Math.min(bKingRow, 7 - bKingRow, bKingCol, 7 - bKingCol);
+
+        const wHeavy = wNonPawnMaterial - bNonPawnMaterial;
+        const bHeavy = bNonPawnMaterial - wNonPawnMaterial;
+        const hasMatingForce_White = wHeavy >= 500;
+        const hasMatingForce_Black = bHeavy >= 500;
+
+        if (materialDiff > 300 && hasMatingForce_White) {
+            score += (3 - bEdgeDist) * 30;
+        } else if (materialDiff < -300 && hasMatingForce_Black) {
+            score -= (3 - wEdgeDist) * 30;
+        }
     }
 
     cacheSet(evalCache, key, score);
@@ -976,18 +1292,15 @@ function hasNonPawnMaterial(b, player) {
     return false;
 }
 
-// ============================================================
-// SEARCH
-// ============================================================
 const SEARCH_CONFIG = {
     baseDepth: 5,
     endgameDepth: 7,
     quiescenceDepth: 3,
-    hardMaxDepth: 8
+    hardMaxDepth: 9
 };
 
 const EXTENSION_SCORE_THRESHOLD = 25;
-const EXTENSION_STABLE_LIMIT = 1;
+const EXTENSION_STABLE_LIMIT = 2;
 let extensionSoftDeadline = 0;
 
 let searchStartTime = 0;
@@ -995,7 +1308,7 @@ let searchDeadline = Infinity;
 let searchAborted = false;
 let nodesSearched = 0;
 
-let searchLinePositions = [];
+let searchLineSet = new Set();
 let avoidRepetition = false;
 let rootEvalWhite = 0;
 const REPETITION_PENALTY = 30;
@@ -1101,18 +1414,38 @@ function quiescenceSearch(b, alpha, beta, player, qDepth) {
 function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
     if (checkTimeOut()) return 0;
 
+    const originalAlpha = alpha;
+    let hashLo = 0, hashHi = 0;
+    let ttHitMove = null;
+
+    if (USE_TT && ply > 0) {
+        const h = computeHash(b, player);
+        hashLo = h.lo;
+        hashHi = h.hi;
+        ttProbes++;
+        const hit = ttProbe(hashLo, hashHi, depth, alpha, beta, ply);
+        if (hit) {
+            if (hit.score !== null) {
+                ttHits++;
+                if (hit.score <= alpha || hit.score >= beta) ttCutoffs++;
+                return hit.score;
+            }
+            if (hit.move) ttHitMove = hit.move;
+        }
+    }
+
     const posKey = boardToHash(b) + player[0];
-    if (ply > 0 && searchLinePositions.includes(posKey)) {
+    if (ply > 0 && searchLineSet.has(posKey)) {
         return avoidRepetition ? (rootEvalWhite > 0 ? -REPETITION_PENALTY : REPETITION_PENALTY) : 0;
     }
-    searchLinePositions.push(posKey);
+    searchLineSet.add(posKey);
 
     const enemy = enemyColor(player);
     const inCheck = isSquareAttackedBy(b, kingSq[player], enemy);
 
     const moves = getAllPossibleMovesForPosition(b, player);
     if (moves.length === 0) {
-        searchLinePositions.pop();
+        searchLineSet.delete(posKey);
         if (inCheck) {
             return player === 'white' ? (-20000 + ply) : (20000 - ply);
         }
@@ -1120,7 +1453,7 @@ function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
     }
 
     if (depth <= 0 && !inCheck) {
-        searchLinePositions.pop();
+        searchLineSet.delete(posKey);
         return quiescenceSearch(b, alpha, beta, player, SEARCH_CONFIG.quiescenceDepth);
     }
 
@@ -1129,7 +1462,7 @@ function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
             depth = 1;
             checkExt++;
         } else {
-            searchLinePositions.pop();
+            searchLineSet.delete(posKey);
             return quiescenceSearch(b, alpha, beta, player, SEARCH_CONFIG.quiescenceDepth);
         }
     }
@@ -1141,17 +1474,26 @@ function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
         const R = 2;
         const nullScore = minimax(b, depth - 1 - R, alpha, beta, enemy, ply + 1, checkExt, false);
         enPassantTarget = savedEp;
-        if (player === 'white' && nullScore >= beta) { searchLinePositions.pop(); return beta; }
-        if (player === 'black' && nullScore <= alpha) { searchLinePositions.pop(); return alpha; }
+        if (player === 'white' && nullScore >= beta) { searchLineSet.delete(posKey); return beta; }
+        if (player === 'black' && nullScore <= alpha) { searchLineSet.delete(posKey); return alpha; }
     }
 
     const killers = (ply < MAX_PLY) ? killerMoves[ply] : null;
-    moves.sort((a, b1) => orderScore(b, b1, killers) - orderScore(b, a, killers));
+    moves.sort((a, b1) => {
+        if (ttHitMove) {
+            const aIsTT = a.from === ttHitMove.from && a.to === ttHitMove.to;
+            const bIsTT = b1.from === ttHitMove.from && b1.to === ttHitMove.to;
+            if (aIsTT && !bIsTT) return -1;
+            if (bIsTT && !aIsTT) return 1;
+        }
+        return orderScore(b, b1, killers) - orderScore(b, a, killers);
+    });
 
     const isMax = (player === 'white');
     const standPat = evaluatePositionForSearch(b, player, moveCount);
     let best = isFinite(standPat) ? standPat : 0;
     let anyMoveSearched = false;
+    let bestMoveInLoop = null;
 
     for (let i = 0; i < moves.length; i++) {
         if (searchAborted) break;
@@ -1191,14 +1533,14 @@ function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
         if (!isFinite(score)) continue;
 
         if (isMax) {
-            if (score > best) best = score;
+            if (score > best) { best = score; bestMoveInLoop = move; }
             if (best > alpha) alpha = best;
             if (alpha >= beta) {
                 if (isQuiet) storeKiller(ply, move);
                 break;
             }
         } else {
-            if (score < best) best = score;
+            if (score < best) { best = score; bestMoveInLoop = move; }
             if (best < beta) beta = best;
             if (beta <= alpha) {
                 if (isQuiet) storeKiller(ply, move);
@@ -1207,18 +1549,25 @@ function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
         }
     }
 
-    searchLinePositions.pop();
+    searchLineSet.delete(posKey);
+
     if (!anyMoveSearched) return standPat;
-    return isFinite(best) ? best : 0;
+    const finalBest = isFinite(best) ? best : 0;
+
+    if (USE_TT && ply > 0 && anyMoveSearched) {
+        let flag;
+        if (finalBest <= originalAlpha) flag = TT_UPPER;
+        else if (finalBest >= beta) flag = TT_LOWER;
+        else flag = TT_EXACT;
+        ttStore(hashLo, hashHi, depth, adjustStoreScore(finalBest, ply), flag, bestMoveInLoop);
+    }
+
+    return finalBest;
 }
 
-// ============================================================
-// SEARCH ENTRY
-// ============================================================
 function findBestMove() {
     searchStartTime = performance.now();
 
-    // v2.7.0: budget derived from clock when a clock is active.
     let budgetMs = 8000;
     if (clockState.enabled) {
         const remaining = getRemainingMs(currentPlayer);
@@ -1231,16 +1580,17 @@ function findBestMove() {
 
     searchAborted = false;
     nodesSearched = 0;
-    searchLinePositions = [];
+    searchLineSet = new Set();
     resetKillerMoves();
+    if (USE_TT) ttClear();
 
     rootEvalWhite = evaluatePositionForSearch(board, currentPlayer, moveCount);
     avoidRepetition = Math.abs(rootEvalWhite) > 150;
 
     for (const state of gameHistory) {
-        searchLinePositions.push(boardToHash(state.boardCopy) + state.currentPlayerCopy[0]);
+        searchLineSet.add(boardToHash(state.boardCopy) + state.currentPlayerCopy[0]);
     }
-    searchLinePositions.push(boardToHash(board) + currentPlayer[0]);
+    searchLineSet.add(boardToHash(board) + currentPlayer[0]);
 
     const allMoves = getAllPossibleMovesForPosition(board, currentPlayer);
     if (allMoves.length === 0) return null;
@@ -1299,6 +1649,9 @@ function findBestMove() {
     }
 
     candidateMoves.sort((a, b1) => {
+        const aQueen = a.promo === 5 ? 1 : 0;
+        const bQueen = b1.promo === 5 ? 1 : 0;
+        if (aQueen !== bQueen) return bQueen - aQueen;
         const va = PIECE_VALUE_ARR[board[a.to]] || 0;
         const vb = PIECE_VALUE_ARR[board[b1.to]] || 0;
         return vb - va;
@@ -1317,7 +1670,7 @@ function findBestMove() {
     let stableCount = 0;
     let extended = false;
 
-    console.log(`🔍 ${currentPlayer.toUpperCase()} searching depth ${baseMaxDepth} (ext to ${absoluteMaxDepth}) budget ${budgetMs.toFixed(0)}ms`);
+    console.log(`🔍 ${currentPlayer.toUpperCase()} searching depth ${baseMaxDepth} (ext to ${absoluteMaxDepth}) budget ${budgetMs.toFixed(0)}ms${USE_TT ? ' [TT]' : ''}`);
 
     for (let depth = 1; depth <= absoluteMaxDepth; depth++) {
         if (searchAborted && depth > 1) break;
@@ -1381,7 +1734,7 @@ function findBestMove() {
                 if (delta < EXTENSION_SCORE_THRESHOLD && !moveChanged) {
                     stableCount++;
                     if (stableCount >= EXTENSION_STABLE_LIMIT) {
-                        console.log(`   ✅ Converged at depth ${depth} (delta ${delta.toFixed(1)}, same move)`);
+                        console.log(`   ✅ Converged at depth ${depth} (delta ${delta.toFixed(1)}, same move, stableCount ${stableCount})`);
                         break;
                     }
                 } else {
@@ -1400,14 +1753,14 @@ function findBestMove() {
     }
 
     const elapsed = (performance.now() - searchStartTime).toFixed(0);
-    console.log(`⏱️ ${elapsed}ms | ${toSAN(board, bestMove, currentPlayer)} | eval ${bestEval.toFixed(1)} | depth ${lastDepth}${extended ? ' (extended)' : ''} | ${nodesSearched} nodes`);
+    const ttInfo = USE_TT
+        ? ` | TT ${ttHits}/${ttProbes} hits (${(100 * ttHits / Math.max(1, ttProbes)).toFixed(1)}%), ${ttCutoffs} cutoffs, ${ttStores} stores`
+        : '';
+    console.log(`⏱️ ${elapsed}ms | ${toSAN(board, bestMove, currentPlayer)} | eval ${bestEval.toFixed(1)} | depth ${lastDepth}${extended ? ' (extended)' : ''} | ${nodesSearched} nodes${ttInfo}`);
 
     return bestMove;
 }
 
-// ============================================================
-// UI RENDERING
-// ============================================================
 function createBoard() {
     const boardElement = document.getElementById('chessboard');
     if (!boardElement) return;
@@ -1502,12 +1855,7 @@ function showPossibleMoves(row, col) {
     }
 }
 
-// ============================================================
-// MOVE PLAYING
-// ============================================================
 function playMove(fromRow, fromCol, toRow, toCol) {
-    // Flag check before playing: if the mover's clock is already spent,
-    // the game ends and the move is not made.
     if (clockState.enabled && !gameOver && getRemainingMs(currentPlayer) <= 0) {
         gameOver = true;
         const winner = currentPlayer === 'white' ? 'Black' : 'White';
@@ -1545,7 +1893,6 @@ function playMove(fromRow, fromCol, toRow, toCol) {
 
     makeMoveOnBoard(board, chosen);
 
-    // Commit the mover's clock and apply their increment.
     const mover = currentPlayer;
     commitClock();
     applyIncrement(mover);
@@ -1557,7 +1904,6 @@ function playMove(fromRow, fromCol, toRow, toCol) {
     if (currentPlayer === 'black') moveCount++;
     currentPlayer = enemyColor(currentPlayer);
 
-    // Start the opponent's clock.
     startClockFor(currentPlayer);
 
     const resultKey = boardToHash(board) + currentPlayer[0];
@@ -1640,7 +1986,6 @@ function makeAIMove() {
     if (thinking) thinking.style.display = 'block';
     if (sync) sync.textContent = `AI (${aiPlayer}) thinking...`;
 
-    // Force a display update so the AI's clock is shown at "search start"
     updateClockDisplay();
 
     setTimeout(() => {
@@ -1656,9 +2001,6 @@ function makeAIMove() {
     }, 50);
 }
 
-// ============================================================
-// PARSE ALGEBRAIC MOVE (book format)
-// ============================================================
 function parseAlgebraicMove(str) {
     if (!str || str.length < 4) return null;
     const fromCol = str.charCodeAt(0) - 97;
@@ -1670,9 +2012,6 @@ function parseAlgebraicMove(str) {
     return { fromRow, fromCol, toRow, toCol };
 }
 
-// ============================================================
-// UI BUTTONS
-// ============================================================
 function newGame() {
     resetBoardToStart();
     currentPlayer = 'white';
@@ -1689,10 +2028,10 @@ function newGame() {
                        blackKingside: true, blackQueenside: true };
     enPassantTarget = null;
     evalCache.clear();
+    if (USE_TT) ttClear();
     gamePositionCounts = new Map();
     gamePositionCounts.set(boardToHash(board) + 'w', 1);
 
-    // Reset and start the clock for the new game.
     initClock(currentTimeControl);
     startClockFor('white');
     startClockTicker();
@@ -1731,7 +2070,6 @@ function undoMove() {
     uciHistory.pop();
     gameOver = false;
 
-    // Restart clock for the (now) current player.
     startClockFor(currentPlayer);
 
     createBoard();
@@ -1773,7 +2111,6 @@ function changeTimeControl() {
         console.log(`   Unlimited`);
     }
 
-    // Apply immediately. If a game is in progress, this resets the clocks.
     initClock(newControl);
     if (!gameOver) {
         startClockFor(currentPlayer);
@@ -1784,13 +2121,11 @@ function changeTimeControl() {
 function clearMemory() {
     if (confirm('Clear AI memory?')) {
         evalCache.clear();
+        if (USE_TT) ttClear();
         alert('AI memory cleared!');
     }
 }
 
-// ============================================================
-// INIT
-// ============================================================
 window.addEventListener('load', function() {
     if (typeof ChessAILearner !== 'undefined') {
         enhancedAI = new ChessAILearner();
@@ -1807,7 +2142,6 @@ window.addEventListener('load', function() {
 
     gamePositionCounts.set(boardToHash(board) + 'w', 1);
 
-    // Read the initial time control from the select.
     const tcSel = document.getElementById('timeControl');
     currentTimeControl = tcSel ? tcSel.value : 'unlimited';
 
@@ -1821,6 +2155,7 @@ window.addEventListener('load', function() {
     changeGameMode();
 
     console.log(`♔ Chess Game v${GAME_VERSION} Loaded! ♛`);
+    console.log(`⚙️ TT: ${USE_TT ? 'ON' : 'OFF'} (${(1 << TT_BITS).toLocaleString()} entries)`);
 });
 
 if (typeof window !== 'undefined') {
@@ -1832,4 +2167,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - working clock`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - opening development fix active`);
